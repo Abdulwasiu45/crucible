@@ -1139,3 +1139,332 @@ mod budget_profile_tests {
         assert!(!over.fits_budget(&profile));
     }
 }
+
+// Location: contracts/crucible/src/sim.rs // Production requirement: Automated Storage Entry Footprint & Rent Cost Calculator
+
+/// Storage lifetime class of a contract data entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StorageDurability {
+    /// `env.storage().instance()` — stored in the contract instance entry and
+    /// rented at the persistent rate.
+    Instance,
+    /// `env.storage().persistent()` — archived (restorable) when its TTL expires.
+    Persistent,
+    /// `env.storage().temporary()` — deleted for good when its TTL expires.
+    Temporary,
+}
+
+/// Byte footprint of one key/value pair written to contract storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageEntryFootprint {
+    /// Storage lifetime class the entry was written to.
+    pub durability: StorageDurability,
+    /// XDR-encoded size of the key in bytes.
+    pub key_bytes: u32,
+    /// XDR-encoded size of the value in bytes.
+    pub value_bytes: u32,
+}
+
+impl StorageEntryFootprint {
+    /// Total ledger bytes occupied by the entry (key + value).
+    pub fn total_bytes(&self) -> u32 {
+        self.key_bytes.saturating_add(self.value_bytes)
+    }
+}
+
+/// Soroban network rent parameters (`ConfigSettingContractLedgerCostV0` /
+/// `StateArchivalSettings`).
+///
+/// Rent for an entry over `ledgers` is
+/// `ceil(bytes * write_fee_per_1kb * ledgers / (1024 * rent_rate_denominator))`,
+/// where the denominator depends on the entry's durability. Fields are public
+/// so the config can be aligned with any network's live settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RentConfig {
+    /// Fee in stroops for writing 1 KB to the ledger.
+    pub write_fee_per_1kb: i64,
+    /// Rent rate denominator for persistent and instance entries.
+    pub persistent_rent_rate_denominator: i64,
+    /// Rent rate denominator for temporary entries.
+    pub temp_rent_rate_denominator: i64,
+}
+
+impl RentConfig {
+    /// Current Soroban network rent configuration (Protocol 22).
+    pub const fn current() -> Self {
+        Self {
+            write_fee_per_1kb: 11_800,
+            persistent_rent_rate_denominator: 2_103,
+            temp_rent_rate_denominator: 4_206,
+        }
+    }
+
+    /// Computes the rent in stroops for `bytes` of `durability` storage kept
+    /// alive for `ledgers` ledgers.
+    pub fn rent_fee(&self, durability: StorageDurability, bytes: u32, ledgers: u32) -> i64 {
+        let denominator = match durability {
+            StorageDurability::Instance | StorageDurability::Persistent => {
+                self.persistent_rent_rate_denominator
+            }
+            StorageDurability::Temporary => self.temp_rent_rate_denominator,
+        };
+        let numerator = (bytes as i128) * (self.write_fee_per_1kb as i128) * (ledgers as i128);
+        let divisor = 1024_i128 * (denominator.max(1) as i128);
+        let fee = (numerator + divisor - 1) / divisor;
+        i64::try_from(fee).unwrap_or(i64::MAX)
+    }
+}
+
+impl Default for RentConfig {
+    fn default() -> Self {
+        Self::current()
+    }
+}
+
+/// Per-durability bytes and rent produced by [`StorageFootprint::rent_cost`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RentCostReport {
+    /// Bytes held in instance storage.
+    pub instance_bytes: u64,
+    /// Bytes held in persistent storage.
+    pub persistent_bytes: u64,
+    /// Bytes held in temporary storage.
+    pub temporary_bytes: u64,
+    /// Rent in stroops for instance storage.
+    pub instance_rent: i64,
+    /// Rent in stroops for persistent storage.
+    pub persistent_rent: i64,
+    /// Rent in stroops for temporary storage.
+    pub temporary_rent: i64,
+}
+
+impl RentCostReport {
+    /// Total bytes across all durabilities.
+    pub fn total_bytes(&self) -> u64 {
+        self.instance_bytes + self.persistent_bytes + self.temporary_bytes
+    }
+
+    /// Total rent in stroops across all durabilities.
+    pub fn total_rent(&self) -> i64 {
+        self.instance_rent
+            .saturating_add(self.persistent_rent)
+            .saturating_add(self.temporary_rent)
+    }
+}
+
+/// Suggests moving a persistent entry to temporary storage to save rent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageRecommendation {
+    /// Index of the entry in [`StorageFootprint::entries`].
+    pub entry_index: usize,
+    /// Rent in stroops if the entry stays persistent.
+    pub persistent_rent: i64,
+    /// Rent in stroops if the entry is stored as temporary instead.
+    pub temporary_rent: i64,
+}
+
+impl StorageRecommendation {
+    /// Stroops saved by switching the entry to temporary storage.
+    pub fn savings(&self) -> i64 {
+        self.persistent_rent - self.temporary_rent
+    }
+}
+
+impl std::fmt::Display for StorageRecommendation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "entry #{} costs {} stroops as Persistent but {} as Temporary (saves {}); \
+             use Temporary if the data can be recreated after it expires",
+            self.entry_index,
+            self.persistent_rent,
+            self.temporary_rent,
+            self.savings()
+        )
+    }
+}
+
+/// Records the keys and values written to contract storage during a
+/// simulated transaction and estimates their rent.
+///
+/// ```ignore
+/// let mut footprint = StorageFootprint::new();
+/// footprint.record_entry(env.inner(), StorageDurability::Persistent, &key, &balance);
+/// let report = footprint.rent_cost(&RentConfig::current(), 535_680);
+/// for rec in footprint.recommendations(&RentConfig::current(), 17_280) {
+///     println!("{rec}");
+/// }
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct StorageFootprint {
+    entries: Vec<StorageEntryFootprint>,
+}
+
+impl StorageFootprint {
+    /// Creates an empty footprint.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records an entry by its XDR-encoded key and value sizes.
+    pub fn record_entry<K, V>(
+        &mut self,
+        env: &soroban_sdk::Env,
+        durability: StorageDurability,
+        key: &K,
+        value: &V,
+    ) where
+        K: soroban_sdk::IntoVal<soroban_sdk::Env, soroban_sdk::Val> + Clone,
+        V: soroban_sdk::IntoVal<soroban_sdk::Env, soroban_sdk::Val> + Clone,
+    {
+        use soroban_sdk::xdr::ToXdr;
+        let key_val: soroban_sdk::Val = key.clone().into_val(env);
+        let value_val: soroban_sdk::Val = value.clone().into_val(env);
+        self.record(
+            durability,
+            key_val.to_xdr(env).len(),
+            value_val.to_xdr(env).len(),
+        );
+    }
+
+    /// Records an entry from already-known key and value byte sizes.
+    pub fn record(&mut self, durability: StorageDurability, key_bytes: u32, value_bytes: u32) {
+        self.entries.push(StorageEntryFootprint {
+            durability,
+            key_bytes,
+            value_bytes,
+        });
+    }
+
+    /// Returns every recorded entry, in recording order.
+    pub fn entries(&self) -> &[StorageEntryFootprint] {
+        &self.entries
+    }
+
+    /// Total bytes recorded for `durability`.
+    pub fn total_bytes(&self, durability: StorageDurability) -> u64 {
+        self.entries
+            .iter()
+            .filter(|e| e.durability == durability)
+            .map(|e| e.total_bytes() as u64)
+            .sum()
+    }
+
+    /// Computes per-durability rent for keeping every entry alive `ledgers` ledgers.
+    pub fn rent_cost(&self, config: &RentConfig, ledgers: u32) -> RentCostReport {
+        let mut report = RentCostReport::default();
+        for entry in &self.entries {
+            let bytes = entry.total_bytes();
+            let rent = config.rent_fee(entry.durability, bytes, ledgers);
+            match entry.durability {
+                StorageDurability::Instance => {
+                    report.instance_bytes += bytes as u64;
+                    report.instance_rent = report.instance_rent.saturating_add(rent);
+                }
+                StorageDurability::Persistent => {
+                    report.persistent_bytes += bytes as u64;
+                    report.persistent_rent = report.persistent_rent.saturating_add(rent);
+                }
+                StorageDurability::Temporary => {
+                    report.temporary_bytes += bytes as u64;
+                    report.temporary_rent = report.temporary_rent.saturating_add(rent);
+                }
+            }
+        }
+        report
+    }
+
+    /// Lists persistent entries that would be cheaper as temporary storage
+    /// for a `ledgers`-long lifetime.
+    pub fn recommendations(&self, config: &RentConfig, ledgers: u32) -> Vec<StorageRecommendation> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.durability == StorageDurability::Persistent)
+            .filter_map(|(entry_index, e)| {
+                let bytes = e.total_bytes();
+                let persistent_rent = config.rent_fee(StorageDurability::Persistent, bytes, ledgers);
+                let temporary_rent = config.rent_fee(StorageDurability::Temporary, bytes, ledgers);
+                (temporary_rent < persistent_rent).then_some(StorageRecommendation {
+                    entry_index,
+                    persistent_rent,
+                    temporary_rent,
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod storage_rent_tests {
+    use super::*;
+    use soroban_sdk::{symbol_short, Env};
+
+    #[test]
+    fn rent_fee_follows_the_network_formula() {
+        let config = RentConfig::current();
+        // 1024 bytes for one persistent "rent period" of 2103 ledgers costs
+        // exactly one 1 KB write fee.
+        assert_eq!(config.rent_fee(StorageDurability::Persistent, 1024, 2_103), 11_800);
+        assert_eq!(config.rent_fee(StorageDurability::Instance, 1024, 2_103), 11_800);
+        assert_eq!(config.rent_fee(StorageDurability::Temporary, 1024, 4_206), 11_800);
+        assert_eq!(config.rent_fee(StorageDurability::Persistent, 0, 2_103), 0);
+        // Partial stroops round up.
+        assert_eq!(config.rent_fee(StorageDurability::Persistent, 1, 1), 1);
+    }
+
+    #[test]
+    fn record_entry_measures_xdr_sizes() {
+        let env = Env::default();
+        let mut footprint = StorageFootprint::new();
+        footprint.record_entry(&env, StorageDurability::Persistent, &symbol_short!("bal"), &500_i128);
+        let entry = &footprint.entries()[0];
+        assert!(entry.key_bytes > 0);
+        assert!(entry.value_bytes > 0);
+        assert_eq!(
+            footprint.total_bytes(StorageDurability::Persistent),
+            entry.total_bytes() as u64
+        );
+    }
+
+    #[test]
+    fn rent_cost_splits_by_durability() {
+        let config = RentConfig::current();
+        let mut footprint = StorageFootprint::new();
+        footprint.record(StorageDurability::Instance, 24, 1000);
+        footprint.record(StorageDurability::Persistent, 24, 1000);
+        footprint.record(StorageDurability::Temporary, 24, 1000);
+
+        let report = footprint.rent_cost(&config, 2_103);
+        assert_eq!(report.total_bytes(), 3 * 1024);
+        assert_eq!(report.instance_rent, 11_800);
+        assert_eq!(report.persistent_rent, 11_800);
+        assert_eq!(report.temporary_rent, 5_900);
+        assert_eq!(report.total_rent(), 29_500);
+    }
+
+    #[test]
+    fn recommends_temporary_for_persistent_entries_only() {
+        let config = RentConfig::current();
+        let mut footprint = StorageFootprint::new();
+        footprint.record(StorageDurability::Instance, 24, 1000);
+        footprint.record(StorageDurability::Persistent, 24, 1000);
+        footprint.record(StorageDurability::Temporary, 24, 1000);
+
+        let recs = footprint.recommendations(&config, 2_103);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].entry_index, 1);
+        assert_eq!(recs[0].persistent_rent, 11_800);
+        assert_eq!(recs[0].temporary_rent, 5_900);
+        assert_eq!(recs[0].savings(), 5_900);
+        assert!(recs[0].to_string().contains("saves 5900"));
+    }
+
+    #[test]
+    fn no_recommendation_when_rent_is_zero() {
+        let config = RentConfig::current();
+        let mut footprint = StorageFootprint::new();
+        footprint.record(StorageDurability::Persistent, 24, 1000);
+        assert!(footprint.recommendations(&config, 0).is_empty());
+    }
+}
