@@ -25,7 +25,7 @@ use soroban_sdk::{
     testutils::{ContractEvents, Events, Ledger, Register},
     Address, Env, FromVal, IntoVal, Val, Vec as SorobanVec,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration as StdDuration;
@@ -351,6 +351,9 @@ pub struct MockEnv {
     /// Host event-buffer indices suppressed after speculative rollback, plus
     /// bookkeeping so a metering-driven buffer clear invalidates stale hides.
     event_rollback: Rc<RefCell<EventRollbackState>>,
+    /// Counter for auto-generated `unnamed_<N>` account names, scoped to this
+    /// environment so parallel tests never share or race on it.
+    unnamed_account_counter: Rc<Cell<u64>>,
 }
 
 /// Tracks speculative event hides and detects host buffer resets.
@@ -1078,6 +1081,13 @@ impl MockEnv {
         self.accounts.borrow_mut().insert(name.to_string(), address);
     }
 
+    /// Returns the next id for an auto-generated `unnamed_<N>` account name.
+    pub(crate) fn next_unnamed_account_id(&self) -> u64 {
+        let id = self.unnamed_account_counter.get();
+        self.unnamed_account_counter.set(id + 1);
+        id
+    }
+
     /// Register a contract with its type name.
     pub fn register_contract<C>(&self, address: Address) {
         let type_name = std::any::type_name::<C>();
@@ -1548,6 +1558,9 @@ impl MockEnv {
             // must never be redeemable in the other.
             checkpoints: Rc::new(RefCell::new(self.checkpoints.borrow().forked())),
             event_rollback: Rc::new(RefCell::new(self.event_rollback.borrow().clone())),
+            // Continue from the current value so unnamed accounts created in
+            // the fork never collide with names copied from the original.
+            unnamed_account_counter: Rc::new(Cell::new(self.unnamed_account_counter.get())),
         }
     }
 
@@ -2075,6 +2088,7 @@ impl Default for MockEnv {
             crypto_registry: Rc::new(RefCell::new(MockCryptoRegistry::new())),
             checkpoints: Rc::new(RefCell::new(CheckpointStack::new())),
             event_rollback,
+            unnamed_account_counter: Rc::new(Cell::new(0)),
         }
     }
 }

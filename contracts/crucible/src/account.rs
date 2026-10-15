@@ -12,10 +12,6 @@
 use crate::env::{MockEnv, Stroops};
 use crate::token::MockToken;
 use soroban_sdk::Address;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Global counter for generating unique unnamed account identifiers.
-static UNNAMED_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A handle to a Soroban account used in tests.
 #[derive(Clone)]
@@ -102,11 +98,12 @@ pub struct AccountBuilder<'env> {
 impl<'env> AccountBuilder<'env> {
     /// Creates a new `AccountBuilder` for the given environment.
     ///
-    /// The default name is auto-generated as `"unnamed_<N>"` using a global
-    /// atomic counter, preventing collisions when multiple unnamed accounts
-    /// are built in the same test run.
+    /// The default name is auto-generated as `"unnamed_<N>"` using a counter
+    /// owned by the `MockEnv`, preventing collisions when multiple unnamed
+    /// accounts are built in the same environment without sharing state
+    /// across parallel tests.
     pub fn new(env: &'env MockEnv) -> Self {
-        let id = UNNAMED_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let id = env.next_unnamed_account_id();
         Self {
             env,
             name: format!("unnamed_{}", id),
@@ -155,7 +152,7 @@ impl<'env> AccountBuilder<'env> {
         let name = if self.name.is_empty() {
             format!(
                 "unnamed_{}",
-                UNNAMED_COUNTER.fetch_add(1, Ordering::Relaxed)
+                self.env.next_unnamed_account_id()
             )
         } else {
             self.name.clone()
