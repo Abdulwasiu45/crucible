@@ -54,7 +54,7 @@ impl CostReport {
     }
     pub fn instructions(&self) -> u64 { self.instructions }
     pub fn memory_bytes(&self) -> u64 { self.memory }
-    pub fn fee_stroops(&self) -> i64 { (self.instructions / 100) as i64 }
+    pub fn fee_stroops(&self) -> i64 { crate::sim::BudgetProfile::current().instruction_fee(self.instructions) }
     pub fn report(&self) -> String {
         format!("Instructions: {}\nMemory: {} bytes\nFee: {} stroops",
             format_with_commas(self.instructions),

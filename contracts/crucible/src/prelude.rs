@@ -23,6 +23,7 @@ pub use crate::env::MockEnv;
 pub use crate::env::MockEnvBuilder;
 pub use crate::env::ProtocolVersion;
 pub use crate::env::Stroops;
+pub use crate::sim::BudgetProfile;
 pub use crate::sim::ContractError;
 pub use crate::sim::IngressLock;
 pub use crate::sim::IngressLockValidator;

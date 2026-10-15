@@ -64,6 +64,12 @@ impl<T> SimulatedTx<T> {
     pub fn into_result(self) -> Option<T> {
         self.result
     }
+
+    /// Returns whether the call's instruction count fits within the
+    /// per-transaction CPU limit of the given network budget profile.
+    pub fn fits_budget(&self, profile: &BudgetProfile) -> bool {
+        self.instructions <= profile.tx_max_instructions
+    }
 }
 
 /// A commit-capable dry-run of a contract call.
@@ -1029,5 +1035,107 @@ mod wasm_memory_monitor_tests {
         assert_eq!(mon.current_pages(), 1);
         mon.allocate_bytes(WASM_PAGE_SIZE_BYTES + 1).unwrap();
         assert_eq!(mon.current_pages(), 1 + 2);
+    }
+}
+
+// Location: contracts/crucible/src/sim.rs // Production requirement: CPU & Memory Fuel Simulation Variance from Protocol 22 Network
+
+/// Network resource limits and fee rates used to evaluate simulated calls.
+///
+/// Mirrors the Soroban network configuration settings
+/// (`ConfigSettingContractComputeV0` / `ConfigSettingContractLedgerCostV0`)
+/// so local profiling flags calls that would exceed Testnet / Mainnet limits.
+/// Fields are public so a profile can be adjusted to match any network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetProfile {
+    /// Maximum CPU instructions a single transaction may consume.
+    pub tx_max_instructions: u64,
+    /// Maximum memory (bytes) a single transaction may consume.
+    pub tx_memory_limit: u64,
+    /// Fee in stroops charged per 10,000 CPU instructions.
+    pub fee_per_instructions_increment: i64,
+}
+
+/// Instruction increment used by the network when charging compute fees.
+pub const INSTRUCTIONS_INCREMENT: u64 = 10_000;
+
+impl BudgetProfile {
+    /// Current Soroban network configuration (Protocol 22, Testnet and Mainnet).
+    pub const fn current() -> Self {
+        Self::protocol_22()
+    }
+
+    /// Soroban Protocol 21 network configuration.
+    pub const fn protocol_21() -> Self {
+        Self {
+            tx_max_instructions: 100_000_000,
+            tx_memory_limit: 41_943_040,
+            fee_per_instructions_increment: 25,
+        }
+    }
+
+    /// Soroban Protocol 22 network configuration.
+    pub const fn protocol_22() -> Self {
+        Self {
+            tx_max_instructions: 100_000_000,
+            tx_memory_limit: 41_943_040,
+            fee_per_instructions_increment: 25,
+        }
+    }
+
+    /// Computes the compute fee in stroops for `instructions`, rounding up to
+    /// the next instruction increment as the network does.
+    pub fn instruction_fee(&self, instructions: u64) -> i64 {
+        let increments = instructions.div_ceil(INSTRUCTIONS_INCREMENT);
+        (increments as i64).saturating_mul(self.fee_per_instructions_increment)
+    }
+
+    /// Returns whether `instructions` and `memory_bytes` both fit within the
+    /// per-transaction limits of this profile.
+    pub fn fits(&self, instructions: u64, memory_bytes: u64) -> bool {
+        instructions <= self.tx_max_instructions && memory_bytes <= self.tx_memory_limit
+    }
+}
+
+impl Default for BudgetProfile {
+    fn default() -> Self {
+        Self::current()
+    }
+}
+
+#[cfg(test)]
+mod budget_profile_tests {
+    use super::*;
+
+    #[test]
+    fn current_matches_protocol_22() {
+        assert_eq!(BudgetProfile::current(), BudgetProfile::protocol_22());
+        assert_eq!(BudgetProfile::default(), BudgetProfile::current());
+    }
+
+    #[test]
+    fn instruction_fee_rounds_up_to_increment() {
+        let profile = BudgetProfile::current();
+        assert_eq!(profile.instruction_fee(0), 0);
+        assert_eq!(profile.instruction_fee(1), 25);
+        assert_eq!(profile.instruction_fee(10_000), 25);
+        assert_eq!(profile.instruction_fee(10_001), 50);
+    }
+
+    #[test]
+    fn fits_respects_network_limits() {
+        let profile = BudgetProfile::current();
+        assert!(profile.fits(100_000_000, 41_943_040));
+        assert!(!profile.fits(100_000_001, 0));
+        assert!(!profile.fits(0, 41_943_041));
+    }
+
+    #[test]
+    fn simulated_tx_fits_budget_checks_instruction_limit() {
+        let profile = BudgetProfile::current();
+        let ok = SimulatedTx::new(0, 100_000_000, Vec::new(), true, Some(()));
+        let over = SimulatedTx::new(0, 100_000_001, Vec::new(), true, Some(()));
+        assert!(ok.fits_budget(&profile));
+        assert!(!over.fits_budget(&profile));
     }
 }
