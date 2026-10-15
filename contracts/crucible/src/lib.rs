@@ -14,6 +14,8 @@ mod checkpoint_tests;
 mod env_crypto_tests;
 #[cfg(test)]
 mod env_event_filter_tests;
+#[cfg(test)]
+mod env_error_demangle_tests;
 mod event_topic_match;
 pub mod fixture;
 pub mod fixture_graph;

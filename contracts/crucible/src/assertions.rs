@@ -345,7 +345,7 @@ fn contract_error_code(error: soroban_sdk::Error) -> u32 {
 /// The Soroban host renders contract failures as
 /// `HostError: Error(Contract, #7)`; this pulls the `7` out of that. Returns
 /// `None` for any payload that is not a contract error.
-fn parse_contract_error_code(message: &str) -> Option<u32> {
+pub(crate) fn parse_contract_error_code(message: &str) -> Option<u32> {
     let after = message.split("Error(Contract, #").nth(1)?;
     let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
@@ -375,6 +375,61 @@ mod tests {
         );
         assert_eq!(parse_contract_error_code("plain old panic"), None);
     }
+}
+
+/// Core assertion helper for `assert_reverts!(.., err = ..)`.
+///
+/// Checks that `outcome` is a revert carrying `expected`'s contract error
+/// code. When a `registry` is given, the actual error is demangled back to its
+/// `#[contracterror]` variant name so the failure diff names both sides.
+#[doc(hidden)]
+#[track_caller]
+pub fn assert_reverted_with_error<E>(
+    outcome: std::thread::Result<()>,
+    expected: E,
+    expr: &str,
+    registry: Option<&crate::env::ErrorRegistry>,
+) where
+    E: Copy + std::fmt::Debug + Into<soroban_sdk::Error>,
+{
+    let expected_code = contract_error_code(expected.into());
+    let expected_desc = std::format!(
+        "{name} (contract error #{expected_code})",
+        name = crate::env::ErrorRegistry::variant_name(&expected),
+    );
+
+    let payload = match outcome {
+        Ok(()) => panic!(
+            "assert_reverts! failed: the expression did not revert (panic).\n\
+             \n\
+             Expression : {expr}\n\
+             Expected   : {expected_desc}",
+        ),
+        Err(payload) => payload,
+    };
+
+    let message = panic_payload_message(payload.as_ref());
+    let actual_code = message.as_deref().and_then(parse_contract_error_code);
+    if actual_code == Some(expected_code) {
+        return;
+    }
+
+    let actual = match actual_code {
+        Some(code) => match registry.and_then(|r| r.lookup(code)) {
+            Some(name) => std::format!("{name} (contract error #{code})"),
+            None => std::format!("contract error #{code}"),
+        },
+        None => "no contract error code in the panic payload".to_string(),
+    };
+    panic!(
+        "assert_reverts! failed: the expression reverted with a different error.\n\
+         \n\
+         Expression : {expr}\n\
+         Expected   : {expected_desc}\n\
+         Actual     : {actual}\n\
+         Panic      : {panic}",
+        panic = message.as_deref().unwrap_or("<unavailable>"),
+    );
 }
 
 /// Helper trait to obtain a reference to a `soroban_sdk::Env`.

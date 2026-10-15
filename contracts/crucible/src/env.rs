@@ -354,6 +354,71 @@ pub struct MockEnv {
     /// Counter for auto-generated `unnamed_<N>` account names, scoped to this
     /// environment so parallel tests never share or race on it.
     unnamed_account_counter: Rc<Cell<u64>>,
+    /// Contract error code → `#[contracterror]` variant names, used to
+    /// demangle `Error(Contract, #N)` reverts.
+    error_registry: Rc<RefCell<ErrorRegistry>>,
+}
+
+// Location: contracts/crucible/src/env.rs // Production requirement: Comprehensive Error Variant & Panic Reason Demangler
+
+/// Maps contract error codes back to the `#[contracterror]` enum variants that
+/// produce them.
+///
+/// The Soroban host reports contract failures only as `Error(Contract, #N)`.
+/// Registering a contract's error enum lets Crucible render that as
+/// `ContractError::Variant` in assertion failures. Several contracts may reuse
+/// the same code, so a code can map to more than one variant.
+#[derive(Clone, Debug, Default)]
+pub struct ErrorRegistry {
+    variants: HashMap<u32, std::vec::Vec<String>>,
+}
+
+impl ErrorRegistry {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers each variant of a `#[contracterror]` enum under its code.
+    ///
+    /// Non-contract errors are ignored, and registering a variant twice is a
+    /// no-op.
+    pub fn register<E>(&mut self, variants: &[E])
+    where
+        E: Copy + std::fmt::Debug + Into<soroban_sdk::Error>,
+    {
+        use soroban_sdk::xdr::ScErrorType;
+        for variant in variants {
+            let error: soroban_sdk::Error = (*variant).into();
+            if !error.is_type(ScErrorType::Contract) {
+                continue;
+            }
+            let name = Self::variant_name(variant);
+            let names = self.variants.entry(error.get_code()).or_default();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+
+    /// Returns the variant name(s) registered for `code`, joined with ` | `
+    /// when several contracts share it.
+    pub fn lookup(&self, code: u32) -> Option<String> {
+        self.variants.get(&code).map(|names| names.join(" | "))
+    }
+
+    /// Decodes a host panic message such as `HostError: Error(Contract, #1)`
+    /// into the registered variant name(s).
+    pub fn demangle(&self, message: &str) -> Option<String> {
+        crate::assertions::parse_contract_error_code(message).and_then(|code| self.lookup(code))
+    }
+
+    /// Renders an error enum value as `Enum::Variant`.
+    pub fn variant_name<E: std::fmt::Debug>(variant: &E) -> String {
+        let type_name = std::any::type_name::<E>();
+        let short = type_name.rsplit("::").next().unwrap_or(type_name);
+        std::format!("{short}::{variant:?}")
+    }
 }
 
 /// Tracks speculative event hides and detects host buffer resets.
@@ -1561,6 +1626,7 @@ impl MockEnv {
             // Continue from the current value so unnamed accounts created in
             // the fork never collide with names copied from the original.
             unnamed_account_counter: Rc::new(Cell::new(self.unnamed_account_counter.get())),
+            error_registry: Rc::new(RefCell::new(self.error_registry.borrow().clone())),
         }
     }
 
@@ -1983,6 +2049,31 @@ impl MockEnv {
         RevertAssertion::capture(f)
     }
 
+    /// Registers the variants of a `#[contracterror]` enum so reverts carrying
+    /// their codes are demangled back to `Enum::Variant` names.
+    ///
+    /// ```ignore
+    /// env.register_errors(&[VaultError::Unauthorized, VaultError::InsufficientBalance]);
+    /// assert_reverts!(env, client.admin_only(), err = VaultError::Unauthorized);
+    /// ```
+    pub fn register_errors<E>(&self, variants: &[E])
+    where
+        E: Copy + std::fmt::Debug + Into<soroban_sdk::Error>,
+    {
+        self.error_registry.borrow_mut().register(variants);
+    }
+
+    /// Returns a reference guard to the contract error registry.
+    pub fn error_registry(&self) -> std::cell::Ref<'_, ErrorRegistry> {
+        self.error_registry.borrow()
+    }
+
+    /// Decodes a host panic message such as `HostError: Error(Contract, #1)`
+    /// into the registered `Enum::Variant` name(s).
+    pub fn demangle_error(&self, message: &str) -> Option<String> {
+        self.error_registry.borrow().demangle(message)
+    }
+
     /// Returns a mutable reference guard to the mock crypto registry.
     pub fn crypto_registry(&self) -> std::cell::RefMut<'_, MockCryptoRegistry> {
         self.crypto_registry.borrow_mut()
@@ -2089,6 +2180,7 @@ impl Default for MockEnv {
             checkpoints: Rc::new(RefCell::new(CheckpointStack::new())),
             event_rollback,
             unnamed_account_counter: Rc::new(Cell::new(0)),
+            error_registry: Rc::new(RefCell::new(ErrorRegistry::new())),
         }
     }
 }
