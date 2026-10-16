@@ -1,3 +1,9 @@
+## [1.34.1](https://github.com/benelabs/crucible/compare/v1.34.0...v1.34.1) (2026-10-16)
+
+### Bug Fixes
+
+* **supply-chain:** enforce allowable status transitions ([#1092](https://github.com/benelabs/crucible/issues/1092)) ([c7a68f6](https://github.com/benelabs/crucible/commit/c7a68f65ce3678a235a3588d5e82e84ca94d4cdd))
+
 ## [1.34.0](https://github.com/benelabs/crucible/compare/v1.33.0...v1.34.0) (2026-10-01)
 
 ### Features
