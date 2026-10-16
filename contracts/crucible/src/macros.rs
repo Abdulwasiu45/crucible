@@ -18,8 +18,36 @@
 /// assert_reverts!(client.transfer(&alice, &bob, &(-1_i128)));
 /// assert_reverts!(client.claim(), "too early");
 /// ```
+///
+/// Pass `err = <variant>` to require a specific `#[contracterror]` variant.
+/// Prefixing the environment demangles the actual error through the variants
+/// registered with [`MockEnv::register_errors`](crate::env::MockEnv::register_errors):
+///
+/// ```ignore
+/// assert_reverts!(client.admin_only(), err = VaultError::Unauthorized);
+/// assert_reverts!(env, client.admin_only(), err = VaultError::Unauthorized);
+/// ```
 #[macro_export]
 macro_rules! assert_reverts {
+    ($expr:expr, err = $err:expr $(,)?) => {{
+        extern crate std;
+        let __result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            $expr;
+        }));
+        $crate::assertions::assert_reverted_with_error(__result, $err, stringify!($expr), None);
+    }};
+    ($env:expr, $expr:expr, err = $err:expr $(,)?) => {{
+        extern crate std;
+        let __result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            $expr;
+        }));
+        $crate::assertions::assert_reverted_with_error(
+            __result,
+            $err,
+            stringify!($expr),
+            Some(&*$env.error_registry()),
+        );
+    }};
     ($expr:expr) => {{
         extern crate std;
         let __result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
