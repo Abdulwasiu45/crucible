@@ -1,3 +1,9 @@
+## [1.34.2](https://github.com/benelabs/crucible/compare/v1.34.1...v1.34.2) (2026-10-17)
+
+### Bug Fixes
+
+* **oracle:** enforce active DataSource on price submission and purge cached prices on deactivation ([#1080](https://github.com/benelabs/crucible/issues/1080)) ([928e337](https://github.com/benelabs/crucible/commit/928e337809077c2a3e34301f44b062ea5d05d891))
+
 ## [1.34.1](https://github.com/benelabs/crucible/compare/v1.34.0...v1.34.1) (2026-10-16)
 
 ### Bug Fixes
