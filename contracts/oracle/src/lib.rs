@@ -31,9 +31,12 @@ enum DataKey {
     Admin,
     SourceCounter,
     DataSource(u64),
+    SourceByAddress(Address),
     Price(String),
     PriceHistory(String, u64),
     SourceWhitelist(Address),
+    SourceSymbols(Address),
+    PriceSubmitter(String),
 }
 
 /// Oracle Contract with multiple data sources
@@ -43,6 +46,43 @@ pub struct Oracle;
 
 #[contractimpl]
 impl Oracle {
+    /// Load price data for `symbol` and verify it is fresher than [`MAX_STALENESS_SECONDS`].
+    fn load_fresh_price(env: &Env, symbol: String) -> Result<PriceData, &'static str> {
+        let storage = env.storage().instance();
+        let price_data: PriceData = storage
+            .get(&DataKey::Price(symbol))
+            .ok_or("Price not found")?;
+
+        let current_time = env.ledger().timestamp();
+        let age = current_time.saturating_sub(price_data.timestamp);
+        if age > MAX_STALENESS_SECONDS {
+            return Err("Price data is stale");
+        }
+
+        Ok(price_data)
+    }
+
+    /// Look up the `DataSource` associated with `address`.
+    fn find_source_by_address(env: &Env, address: &Address) -> Option<DataSource> {
+        let storage = env.storage().instance();
+        if let Some(source_id) = storage.get::<_, u64>(&DataKey::SourceByAddress(address.clone())) {
+            if let Some(source) = storage.get::<_, DataSource>(&DataKey::DataSource(source_id)) {
+                return Some(source);
+            }
+        }
+
+        let source_counter: u64 = storage.get(&DataKey::SourceCounter).unwrap_or(0);
+        for source_id in 1..=source_counter {
+            if let Some(source) = storage.get::<_, DataSource>(&DataKey::DataSource(source_id)) {
+                if &source.address == address {
+                    return Some(source);
+                }
+            }
+        }
+
+        None
+    }
+
     /// Initialize oracle contract
     pub fn initialize(env: Env, admin: Address) {
         let storage = env.storage().instance();
@@ -68,6 +108,7 @@ impl Oracle {
         };
 
         storage.set(&DataKey::DataSource(counter), &source);
+        storage.set(&DataKey::SourceByAddress(address.clone()), &counter);
         storage.set(&DataKey::SourceCounter, &counter);
         storage.set(&DataKey::SourceWhitelist(address), &true);
 
@@ -96,6 +137,13 @@ impl Oracle {
 
         if !is_whitelisted {
             return Err("Source not whitelisted");
+        }
+
+        // Verify the associated DataSource entity exists and is active (#1080)
+        let data_source =
+            Self::find_source_by_address(&env, &source).ok_or("Source not found")?;
+        if !data_source.active {
+            return Err("Source is deactivated");
         }
 
         if price <= 0 {
@@ -127,6 +175,25 @@ impl Oracle {
         };
 
         storage.set(&DataKey::Price(symbol.clone()), &price_data);
+        storage.set(&DataKey::PriceSubmitter(symbol.clone()), &source);
+
+        // Track symbols submitted by this source so cached prices can be purged on deactivation
+        let mut symbols: Vec<String> = storage
+            .get(&DataKey::SourceSymbols(source.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut already_tracked = false;
+        for i in 0..symbols.len() {
+            if let Some(existing) = symbols.get(i) {
+                if existing == symbol {
+                    already_tracked = true;
+                    break;
+                }
+            }
+        }
+        if !already_tracked {
+            symbols.push_back(symbol.clone());
+            storage.set(&DataKey::SourceSymbols(source), &symbols);
+        }
 
         // Store in history
         storage.set(
@@ -159,16 +226,10 @@ impl Oracle {
             return Err("num_sources must be positive");
         }
 
-        // For MVP, return the latest fresh price.
-        // In production, this would aggregate from multiple sources.
-        let price_data = Self::load_fresh_price(&env, symbol)?;
-        Ok(price_data.price)
-    }
+        let storage = env.storage().instance();
 
-        // Get current price and verify we have enough data
-        let current_price: PriceData = storage
-            .get(&DataKey::Price(symbol.clone()))
-            .ok_or("Price not found")?;
+        // Get current fresh price and verify we have enough data
+        let current_price = Self::load_fresh_price(&env, symbol.clone())?;
 
         // Count active sources
         let source_counter: u64 = storage.get(&DataKey::SourceCounter).unwrap_or(0);
@@ -232,13 +293,13 @@ impl Oracle {
         for i in 0..len {
             let mut min_idx = i;
             for j in (i + 1)..len {
-                if prices.get(j).unwrap_or(&i128::MAX) < prices.get(min_idx).unwrap_or(&i128::MAX) {
+                if prices.get(j).unwrap_or(i128::MAX) < prices.get(min_idx).unwrap_or(i128::MAX) {
                     min_idx = j;
                 }
             }
             if min_idx != i {
-                let temp = *prices.get(i).unwrap_or(&0);
-                let min_val = *prices.get(min_idx).unwrap_or(&0);
+                let temp = prices.get(i).unwrap_or(0);
+                let min_val = prices.get(min_idx).unwrap_or(0);
                 // Manual swap since we can't do tuple assignment easily
                 prices.set(i, min_val);
                 prices.set(min_idx, temp);
@@ -249,12 +310,12 @@ impl Oracle {
         let mid = prices.len() / 2;
         if prices.len() % 2 == 0 {
             // Even: average of two middle values
-            let v1 = *prices.get(mid - 1).unwrap_or(&0);
-            let v2 = *prices.get(mid).unwrap_or(&0);
+            let v1 = prices.get(mid - 1).unwrap_or(0);
+            let v2 = prices.get(mid).unwrap_or(0);
             Ok((v1 + v2) / 2)
         } else {
             // Odd: middle value
-            Ok(*prices.get(mid).unwrap_or(&0))
+            Ok(prices.get(mid).unwrap_or(0))
         }
     }
 
@@ -281,7 +342,27 @@ impl Oracle {
         storage.set(&DataKey::DataSource(source_id), &source);
 
         // Remove from whitelist
-        storage.set(&DataKey::SourceWhitelist(source.address), &false);
+        storage.set(&DataKey::SourceWhitelist(source.address.clone()), &false);
+
+        // Purge cached prices submitted by this deactivated source (#1080)
+        if let Some(symbols) = storage.get::<_, Vec<String>>(&DataKey::SourceSymbols(source.address.clone())) {
+            for i in 0..symbols.len() {
+                if let Some(sym) = symbols.get(i) {
+                    let should_purge = match storage.get::<_, Address>(&DataKey::PriceSubmitter(sym.clone())) {
+                        Some(submitter) => submitter == source.address,
+                        None => storage
+                            .get::<_, PriceData>(&DataKey::Price(sym.clone()))
+                            .map(|pd| pd.source == source.name)
+                            .unwrap_or(false),
+                    };
+                    if should_purge {
+                        storage.remove(&DataKey::Price(sym.clone()));
+                        storage.remove(&DataKey::PriceSubmitter(sym));
+                    }
+                }
+            }
+            storage.remove(&DataKey::SourceSymbols(source.address));
+        }
 
         env.events()
             .publish((symbol_short!("deact"), source_id), 0);
